@@ -302,9 +302,9 @@ def format_event_referenced(event):
 def format_event_cross_referenced(event):
 	template_data = {}
 	template_data['created_at'] = event['created_at']
-	template_data['user_name'] = event['source']['actor']['login']
-	template_data['orig_issue_number'] = event['source']['url'].split('/')[-1]
-	template_data['orig_issue_url'] = event['source']['url'].replace('api.github.com/repos', 'github.com')
+	template_data['user_name'] = event['actor']['login']
+	template_data['orig_issue_number'] = event['source']['issue']['number']
+	template_data['orig_issue_url'] = event['source']['issue']['html_url'].replace('api.github.com/repos', 'github.com')
 	
 	default_template = os.path.join(__location__, 'templates', 'event_cross_referenced.md')
 	template = config.get('format', 'event_cross_referenced', fallback=default_template)
@@ -476,10 +476,10 @@ def get_events_on_issue(which, issue):
 		if ev['event'] == 'referenced' and ev.get('commit_id') is None:
 			continue
 		# Ignore references to test repositories that I created
-		if ev['event'] == 'cross-referenced' and 'alexl_sandbox' in ev['source']['url']:
+		if ev['event'] == 'cross-referenced' and 'alexl_sandbox' in ev['source']['issue']['html_url']:
 			continue
 		# Ignore back-references automatically created during migration of previous issues
-		if ev['event'] == 'cross-referenced' and 'zadara-issues' in ev['source']['url']:
+		if ev['event'] == 'cross-referenced' and 'zadara-issues' in ev['source']['issue']['html_url']:
 			continue
 		created_at_list = by_created_at.get(ev['created_at'])
 		if created_at_list is None:
@@ -592,6 +592,22 @@ def import_comments_and_events(comments, events, issue_number):
 		else:
 			import_event(entry, issue_number)
 
+MILESTONES_MAPPING = {
+	'18.06'      : '18.06',
+	'18.06-SP1'  : '18.06-SP1 (Gen-3 GA)',
+	'19.02'      : '19.02'
+}
+
+LABELS_MAPPING = {
+	'blocking'         : 'Severity - Critical',
+	'bug'              : 'Defect',
+	'enhancement'      : 'Enhancement',
+	'high priority'    : 'Priority - High',
+	'low priority'     : 'Priority - Low',
+	'medium priority'  : 'Priority - Medium',
+	'performance'      : 'Performance',
+}
+
 # Will only import milestones and labels that are in use by the imported issues, and do not exist in the target repository
 def import_issues(issues):
 
@@ -614,17 +630,19 @@ def import_issues(issues):
 	new_issues = []
 	num_new_comments = 0
 	num_new_events = 0
-	new_milestones = []
-	new_labels = []
 	
 	for issue in issues:
 		
 		new_issue = {}
 		new_issue['orig_issue_number'] = issue['number']
+		new_issue['orig_issue_url'] = issue['html_url']
 		new_issue['title'] = issue['title']
 		
-		if issue.get('assignee') is not None and 'login' in issue['assignee']:
-			new_issue['assignee'] = issue['assignee']['login']
+		new_issue['assignees'] = []
+		if issue.get('assignees') is not None:
+			for assignee in issue.get('assignees'):
+				if  'login' in assignee:
+					new_issue['assignees'].append(assignee['login'])
 		
 		if issue['closed_at']:
 			new_issue['orig_issue_closed'] = True
@@ -637,27 +655,33 @@ def import_issues(issues):
 			new_issue['events'] = get_events_on_issue('source', issue)
 			num_new_events += len(new_issue['events'])
 		
-		if config.getboolean('settings', 'import-milestone') and 'milestone' in issue and issue['milestone'] is not None:
+		if config.getboolean('settings', 'import-milestone'):
 			# Since the milestones' ids are going to differ, we will compare them by title instead
-			found_milestone = get_milestone_by_title(issue['milestone']['title'])
-			if found_milestone:
-				new_issue['milestone_object'] = found_milestone
-			else:
-				new_milestone = issue['milestone']
-				new_issue['milestone_object'] = new_milestone
-				known_milestones.append(new_milestone) # Allow it to be found next time
-				new_milestones.append(new_milestone)   # Put it in a queue to add it later
+			if not('milestone' in issue and issue['milestone'] is not None and 'title' in issue['milestone']):
+				error_msg('Source issue {0} does not have a valid milestone set'.format(issue['number']))
+				raise Exception
+			target_milestone_title = MILESTONES_MAPPING.get(issue['milestone']['title'])
+			if target_milestone_title is None:
+				error_msg('Source issue {0} has an unexpected milestone {1}'.format(issue['milestone']['title']))
+				raise Exception
+			target_milestone = get_milestone_by_title(target_milestone_title)
+			if target_milestone is None:
+				error_msg('There is no milestone {0} on destination repo. Known milestones:\n{1}'.format(target_milestone_title, known_milestones))
+				raise Exception
+			new_issue['milestone_object'] = target_milestone
 		
 		if config.getboolean('settings', 'import-labels') and 'labels' in issue and issue['labels'] is not None:
 			new_issue['label_objects'] = []
 			for issue_label in issue['labels']:
-				found_label = get_label_by_name(issue_label['name'])
-				if found_label:
-					new_issue['label_objects'].append(found_label)
-				else:
-					new_issue['label_objects'].append(issue_label)
-					known_labels.append(issue_label) # Allow it to be found next time
-					new_labels.append(issue_label)   # Put it in a queue to add it later
+				target_label_name = LABELS_MAPPING.get(issue_label['name'].lower())
+				if target_label_name is None:
+					progress_msg('Skipping un-needed label {0} in source issue {1}'.format(issue_label['name'], issue['number']))
+					continue
+				target_label = get_label_by_name(target_label_name)
+				if target_label is None:
+					error_msg('There is no label {0} on destination repo'.format(target_label_name))
+					raise Exception
+				new_issue['label_objects'].append(target_label)
 		
 		template_data = {}
 		template_data['user_name'] = issue['user']['login']
@@ -685,22 +709,12 @@ def import_issues(issues):
 	print(" *", len(new_issues), "new issues") 
 	print(" *", num_new_comments, "new comments") 
 	print(" *", num_new_events, "new events") 
-	print(" *", len(new_milestones), "new milestones") 
-	print(" *", len(new_labels), "new labels") 
 	if not config.getboolean('settings', 'yes'):
 		if not query.yes_no("Are you sure you wish to continue?"):
 			sys.exit()
 	print()
 	
 	state.current = state.IMPORTING
-	
-	for milestone in new_milestones:
-		result_milestone = import_milestone(milestone)
-		milestone['number'] = result_milestone['number']
-		milestone['url'] = result_milestone['url']
-	
-	for label in new_labels:
-		result_label = import_label(label)
 	
 	result_issues = []
 	for issue in new_issues:
@@ -709,15 +723,18 @@ def import_issues(issues):
 			issue['milestone'] = issue['milestone_object']['number']
 			del issue['milestone_object']
 		
+		# Always add the "Gen3" label
+		issue_labels = ['Gen3']
 		if 'label_objects' in issue:
-			issue_labels = []
 			for label in issue['label_objects']:
 				issue_labels.append(label['name'])
-			issue['labels'] = issue_labels
 			del issue['label_objects']
+		issue['labels'] = issue_labels
 		
 		orig_issue_number = issue['orig_issue_number']
 		del issue['orig_issue_number']
+		orig_issue_url = issue['orig_issue_url']
+		del issue['orig_issue_url']
 		orig_issue_closed = False
 		if issue.get('orig_issue_closed') is not None:
 			orig_issue_closed = True
@@ -732,7 +749,7 @@ def import_issues(issues):
 			issue_events = issue['events']
 			del issue['events']
 		
-		progress_msg('Creating new issue for original issue {0}, assignee: {1}'.format(orig_issue_number, issue.get('assignee')))
+		progress_msg('Creating new issue for original issue {0}, assignees: {1}'.format(orig_issue_number, issue.get('assignees')))
 		progress_msg(' > {0}'.format(issue['title']))
 		
 		result_issue = send_request('target', "issues", issue, can_retry=False)
@@ -740,6 +757,11 @@ def import_issues(issues):
 		
 		if (issue_comments is not None and len(issue_comments) > 0) or (issue_events is not None and len(issue_events) > 0):
 			import_comments_and_events(issue_comments, issue_events, result_issue['number'])
+		
+		# Create the last comment that says that issue was migrated
+		last_comment_body = "**MIGRATED FROM ORIGINAL ISSUE {0} on {1}**".format(orig_issue_url, datetime.datetime.now().strftime('%Y-%m-%d  %H-%M-%S'))
+		last_comment = {'body' : last_comment_body}
+		send_request('target', "issues/{0}/comments".format(result_issue['number']), last_comment)
 		
 		if orig_issue_closed:
 			progress_msg(' > Original issue {0} is CLOSED, closing the new issue {1}'.format(orig_issue_number, result_issue['number']))
